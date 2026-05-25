@@ -85,6 +85,7 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     block_lens: list[int]
     ssm_sizes: tuple[int, int]
     local_ip: str = ""
+    kv_cache_group_addr_indices: list[list[int]] | None = None
 
 
 @dataclass
@@ -345,6 +346,10 @@ class KVCacheRecvingThread(threading.Thread):
         self.kv_caches = kv_caches
         self.kv_caches_base_addr: dict[str, dict[int, list[int]]] = SizedDict()
         self.kv_caches_base_addr[local_engine_id][local_handshake_port] = local_kv_caches_base_addr
+        self.kv_cache_group_addr_indices_by_engine: dict[str, dict[int, list[list[int]] | None]] = SizedDict()
+        self.kv_cache_group_addr_indices_by_engine[local_engine_id][local_handshake_port] = (
+            kv_cache_group_addr_indices
+        )
         self.block_len_per_addr = block_len_per_addr
         self.hma_group_size = hma_group_size
         self.mamba_ssm_size = mamba_ssm_size
@@ -518,6 +523,9 @@ class KVCacheRecvingThread(threading.Thread):
             self._get_remote_metadata(remote_host, remote_handshake_port)
         remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
         local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
+        remote_kv_cache_group_addr_indices = self.kv_cache_group_addr_indices_by_engine[remote_engine_id].get(
+            remote_handshake_port
+        )
         remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
         session_id = f"{remote_host}:{remote_transfer_port}"
 
@@ -543,14 +551,23 @@ class KVCacheRecvingThread(threading.Thread):
                 grouped_local_block_ids = [[local_block_ids[i][0]]]
 
             if self.kv_cache_group_addr_indices is None:
-                group_addr_indices = range(len(local_kv_caches_base_addrs))
+                local_group_addr_indices = range(len(local_kv_caches_base_addrs))
             else:
-                group_addr_indices = self.kv_cache_group_addr_indices[i]
+                local_group_addr_indices = self.kv_cache_group_addr_indices[i]
 
-            for k in group_addr_indices:
-                src_layer_base_addr = local_kv_caches_base_addrs[k]
-                dst_layer_base_addr = remote_kv_caches_base_addrs[k]
-                block_len = self.block_len_per_addr[k]
+            if remote_kv_cache_group_addr_indices is None:
+                remote_group_addr_indices = range(len(remote_kv_caches_base_addrs))
+            else:
+                remote_group_addr_indices = remote_kv_cache_group_addr_indices[i]
+
+            assert len(local_group_addr_indices) == len(remote_group_addr_indices), (
+                f"KV cache group {i} address count mismatch: "
+                f"local={len(local_group_addr_indices)}, remote={len(remote_group_addr_indices)}"
+            )
+            for local_addr_idx, remote_addr_idx in zip(local_group_addr_indices, remote_group_addr_indices):
+                src_layer_base_addr = local_kv_caches_base_addrs[local_addr_idx]
+                dst_layer_base_addr = remote_kv_caches_base_addrs[remote_addr_idx]
+                block_len = self.block_len_per_addr[local_addr_idx]
                 for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
                     src = src_layer_base_addr + local_block_id[0] * block_len
                     dst = dst_layer_base_addr + remote_block_id[0] * block_len
@@ -814,6 +831,9 @@ class KVCacheRecvingThread(threading.Thread):
                 f"Conflict engine id {engine_id} with local engine id {self.local_engine_id}."
             )
             self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
+            self.kv_cache_group_addr_indices_by_engine[engine_id][remote_handshake_port] = (
+                agent_meta.kv_cache_group_addr_indices
+            )
             self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
         finally:
             if sock is not None:
@@ -1447,6 +1467,7 @@ class MooncakeConnectorWorker:
             block_lens=self.block_len_per_addr,
             ssm_sizes=self._mamba_ssm_size,
             local_ip=get_ip(),
+            kv_cache_group_addr_indices=self.kv_cache_group_addr_indices,
         )
         self.xfer_handshake_metadata = metadata
 

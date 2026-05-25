@@ -1471,6 +1471,43 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             },
         )
 
+    def test_transfer_all_groups_uses_remote_group_addr_indices(self):
+        recv_thread = object.__new__(KVCacheRecvingThread)
+        recv_thread.hma_group_size = 2
+        recv_thread._is_mamba_group = [False, False]
+        recv_thread.num_speculative_tokens = 0
+        recv_thread.local_engine_id = "decode"
+        recv_thread.local_handshake_port = 20000
+        recv_thread.block_len_per_addr = [100, 200]
+        recv_thread.kv_cache_group_addr_indices = [[1], [0]]
+        recv_thread.kv_cache_group_addr_indices_by_engine = {
+            "decode": {20000: [[1], [0]]},
+            "prefill": {30000: [[0], [1]]},
+        }
+        recv_thread.kv_caches_base_addr = {
+            "decode": {20000: [1000, 2000]},
+            "prefill": {30000: [10000, 20000]},
+        }
+        recv_thread.remote_te_port = {"prefill": {30000: 31000}}
+        recv_thread.engine = MagicMock()
+        recv_thread.engine.batch_transfer_sync_read.return_value = 0
+
+        recv_thread._transfer_kv_cache_all_groups({
+            "remote_request_id": "req0",
+            "remote_block_ids": [[4], [6]],
+            "local_block_ids": [[3], [5]],
+            "remote_engine_id": "prefill",
+            "remote_host": "127.0.0.1",
+            "remote_handshake_port": 30000,
+        })
+
+        recv_thread.engine.batch_transfer_sync_read.assert_called_once_with(
+            "127.0.0.1:31000",
+            [2600, 1500],
+            [10800, 20600],
+            [200, 100],
+        )
+
     def test_get_tp_num_need_pulls(self):
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
         worker.num_key_value_heads = 8
