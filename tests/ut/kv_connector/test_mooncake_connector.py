@@ -1412,6 +1412,63 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                                   [1], 0)
         )
 
+    def test_get_mamba_group_kv_split_metadata_for_hybrid_pcp(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker.tp_size = 2
+        worker.tp_rank = 1
+        worker._prefill_tp_size = 2
+        worker.num_speculative_tokens = 0
+
+        meta = types.SimpleNamespace()
+        meta.remote_ptp_size = 2
+        meta.remote_pcp_size = 2
+        meta.remote_dcp_size = 2
+        meta.remote_port = 30000
+        meta.local_block_ids = [[1, 2], [20]]
+        meta.remote_block_ids = [[10, 11], [30, 31, 32, 33, 34]]
+
+        self.assertEqual(
+            worker._get_mamba_group_kv_split_metadata(meta, 1),
+            ([[30001]], [[20]], [[34]]),
+        )
+
+    def test_get_hybrid_kv_split_metadata_merges_attn_and_mamba_groups(self):
+        worker = object.__new__(MooncakeConnectorWorker)
+        worker.hma_group_size = 2
+        worker._is_mamba_group = [False, True]
+        worker.tp_size = 2
+        worker.tp_rank = 1
+        worker._prefill_tp_size = 2
+        worker.num_speculative_tokens = 0
+        worker._get_attn_group_kv_split_metadata = MagicMock(
+            return_value=([[30001], [30003]], [[1], [2]], [[10], [11]])
+        )
+
+        meta = types.SimpleNamespace()
+        meta.remote_ptp_size = 2
+        meta.remote_pcp_size = 2
+        meta.remote_dcp_size = 2
+        meta.remote_port = 30000
+        meta.local_block_ids = [[1, 2], [20]]
+        meta.remote_block_ids = [[10, 11], [30, 31, 32, 33, 34]]
+
+        transfer_mappings = worker._get_hybrid_kv_split_metadata("req0", meta)
+
+        self.assertEqual(
+            transfer_mappings[30001],
+            {
+                "local_block_ids": [[1], [20]],
+                "remote_block_ids": [[10], [34]],
+            },
+        )
+        self.assertEqual(
+            transfer_mappings[30003],
+            {
+                "local_block_ids": [[2], []],
+                "remote_block_ids": [[11], []],
+            },
+        )
+
     def test_get_tp_num_need_pulls(self):
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id)
         worker.num_key_value_heads = 8

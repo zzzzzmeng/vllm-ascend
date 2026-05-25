@@ -330,6 +330,7 @@ class KVCacheRecvingThread(threading.Thread):
         vllm_config: VllmConfig,
         kv_caches: dict[str, Any],
         prefill_pp_layer_partition: str | None = None,
+        kv_cache_group_addr_indices: list[list[int]] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -348,6 +349,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.hma_group_size = hma_group_size
         self.mamba_ssm_size = mamba_ssm_size
         self._is_mamba_group = _is_mamba_group
+        self.kv_cache_group_addr_indices = kv_cache_group_addr_indices
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
@@ -522,18 +524,32 @@ class KVCacheRecvingThread(threading.Thread):
         req_start_time = time.perf_counter()
         src_list, dst_list, length_list = [], [], []
         for i in range(self.hma_group_size):
+            if not local_block_ids[i] or not remote_block_ids[i]:
+                continue
+
             if not self._is_mamba_group[i]:
                 grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
                     remote_block_ids[i], local_block_ids[i]
                 )
             else:
-                transfer_block_idx = len(remote_block_ids[i]) - self.num_speculative_tokens - 1
+                # Hybrid PCP requests pre-select the final Mamba state block in
+                # the transfer planner. Legacy non-CP paths may still pass all
+                # Mamba blocks, so keep the old final-block fallback.
+                if len(remote_block_ids[i]) == 1:
+                    transfer_block_idx = 0
+                else:
+                    transfer_block_idx = len(remote_block_ids[i]) - self.num_speculative_tokens - 1
                 grouped_remote_block_ids = [[remote_block_ids[i][transfer_block_idx]]]
                 grouped_local_block_ids = [[local_block_ids[i][0]]]
 
-            for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
-                zip(local_kv_caches_base_addrs, remote_kv_caches_base_addrs)
-            ):
+            if self.kv_cache_group_addr_indices is None:
+                group_addr_indices = range(len(local_kv_caches_base_addrs))
+            else:
+                group_addr_indices = self.kv_cache_group_addr_indices[i]
+
+            for k in group_addr_indices:
+                src_layer_base_addr = local_kv_caches_base_addrs[k]
+                dst_layer_base_addr = remote_kv_caches_base_addrs[k]
                 block_len = self.block_len_per_addr[k]
                 for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
                     src = src_layer_base_addr + local_block_id[0] * block_len
@@ -1246,14 +1262,19 @@ class MooncakeConnectorWorker:
 
         # Mamba metadata
         self._is_mamba_group = [isinstance(group.kv_cache_spec, MambaSpec) for group in kv_cache_config.kv_cache_groups]
+        self._has_attn_group = any(
+            isinstance(group.kv_cache_spec, FullAttentionSpec) for group in kv_cache_config.kv_cache_groups
+        )
+        self._is_attn_mamba_hybrid = self._has_attn_group and any(self._is_mamba_group)
         mamba_ssm_size = (0, 0)
         self._has_mamba = any(self._is_mamba_group)
         if self._has_mamba:
             assert self._is_hma_required
-            assert self.pcp_size * self.dcp_size == 1
             assert self._prefill_tp_size == self._decode_tp_size, (
                 "Mooncake connector does not support different TP size with Mamba."
             )
+            if self.pcp_size * self.dcp_size > 1 and not self._is_attn_mamba_hybrid:
+                raise AssertionError("Mooncake connector only supports CP with Mamba in attention+Mamba hybrid models.")
             mamba_spec = next(spec for spec in self._layer_specs.values() if isinstance(spec, MambaSpec))
             conv_nbytes, ssm_nbytes = (
                 torch.tensor([], dtype=mamba_spec.dtypes[0]).element_size(),  # type: ignore[misc]
@@ -1332,8 +1353,10 @@ class MooncakeConnectorWorker:
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
         self.block_len_per_addr = list[int]()
+        self.kv_cache_group_addr_indices: list[list[int]] = [[] for _ in range(self.hma_group_size)]
         self.kv_caches = kv_caches
         kv_caches_base_addr = []
+        kv_cache_addr_to_idx: dict[int, int] = {}
         ptrs = []
         lengths = []
         if not self._is_hma_required:
@@ -1350,8 +1373,11 @@ class MooncakeConnectorWorker:
                     self.block_len_per_addr.append(
                         single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
                     )
-                    kv_caches_base_addr.append(single_kv_cache.data_ptr())
-                    ptrs.append(single_kv_cache.data_ptr())
+                    data_ptr = single_kv_cache.data_ptr()
+                    kv_cache_addr_to_idx[data_ptr] = len(kv_caches_base_addr)
+                    kv_caches_base_addr.append(data_ptr)
+                    self.kv_cache_group_addr_indices[0].append(kv_cache_addr_to_idx[data_ptr])
+                    ptrs.append(data_ptr)
                     lengths.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape))
         elif self._has_mamba:
             conv_padding = 0
@@ -1368,7 +1394,14 @@ class MooncakeConnectorWorker:
                     if isinstance(kv_cache_tuple, (list, tuple)) is False:
                         kv_cache_tuple = [kv_cache_tuple]
                     for single_kv_cache in kv_cache_tuple:
-                        if single_kv_cache.data_ptr() in kv_caches_base_addr:
+                        data_ptr = single_kv_cache.data_ptr()
+                        group_idx = next(
+                            idx
+                            for idx, group in enumerate(self.kv_cache_config.kv_cache_groups)
+                            if layer_name in group.layer_names
+                        )
+                        if data_ptr in kv_cache_addr_to_idx:
+                            self.kv_cache_group_addr_indices[group_idx].append(kv_cache_addr_to_idx[data_ptr])
                             continue
                         tensor_num_blocks = single_kv_cache.shape[0]
                         block_size_scale = tensor_num_blocks // self.num_blocks
@@ -1376,8 +1409,10 @@ class MooncakeConnectorWorker:
                         self.block_len_per_addr.append(
                             single_kv_cache.element_size() * math.prod(block_shape) * block_size_scale
                         )
-                        kv_caches_base_addr.append(single_kv_cache.data_ptr())
-                        share_tensor_addr.append(single_kv_cache.data_ptr())
+                        kv_cache_addr_to_idx[data_ptr] = len(kv_caches_base_addr)
+                        kv_caches_base_addr.append(data_ptr)
+                        self.kv_cache_group_addr_indices[group_idx].append(kv_cache_addr_to_idx[data_ptr])
+                        share_tensor_addr.append(data_ptr)
                     if isinstance(layer_spec, MambaSpec) and len(self._mamba_ssm_size) == 2:
                         conv_padding = self.num_blocks * self._mamba_ssm_size[0]
                 if share_tensor_addr:
@@ -1440,6 +1475,7 @@ class MooncakeConnectorWorker:
                 self.vllm_config,
                 self.kv_caches,
                 self._prefill_pp_layer_partition,
+                self.kv_cache_group_addr_indices,
             )
             self.kv_recv_thread.start()
 
@@ -1685,6 +1721,75 @@ class MooncakeConnectorWorker:
 
         return remote_handshake_port_list, local_block_ids_list, remote_block_ids_list
 
+    def _get_attn_group_kv_split_metadata(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+        group_idx: int,
+    ) -> tuple[list[list[int]], list[list[int]], list[list[int]]]:
+        if not meta.local_block_ids[group_idx] or not meta.remote_block_ids[group_idx]:
+            return [], [], []
+        group_meta = copy.copy(meta)
+        group_meta.local_block_ids = meta.local_block_ids[group_idx]
+        group_meta.remote_block_ids = meta.remote_block_ids[group_idx]
+        return self._get_kv_split_metadata(req_id, group_meta)
+
+    def _get_mamba_group_kv_split_metadata(
+        self,
+        meta: ReqMeta,
+        group_idx: int,
+    ) -> tuple[list[list[int]], list[list[int]], list[list[int]]]:
+        prefill_tp_size = meta.remote_ptp_size if getattr(meta, "remote_ptp_size", None) else self._prefill_tp_size
+        assert prefill_tp_size == self.tp_size, "Mooncake connector does not support different TP size with Mamba."
+
+        local_block_ids = meta.local_block_ids[group_idx]
+        remote_block_ids = meta.remote_block_ids[group_idx]
+        if not local_block_ids or not remote_block_ids:
+            return [], [], []
+
+        remote_cp_size = meta.remote_pcp_size * meta.remote_dcp_size
+        final_remote_block_idx = len(remote_block_ids) - self.num_speculative_tokens - 1
+        final_remote_block_idx = max(final_remote_block_idx, 0)
+        remote_final_cp_rank = final_remote_block_idx % remote_cp_size
+        remote_pcp_rank = remote_final_cp_rank // meta.remote_dcp_size
+        remote_handshake_port = meta.remote_port + remote_pcp_rank * prefill_tp_size + self.tp_rank
+
+        return [[remote_handshake_port]], [[local_block_ids[0]]], [[remote_block_ids[final_remote_block_idx]]]
+
+    def _merge_group_kv_split_metadata(
+        self,
+        remote_handshake_port_list: list[list[int]],
+        local_block_ids_list: list[list[int]],
+        remote_block_ids_list: list[list[int]],
+        group_idx: int,
+        transfer_mappings: dict[int, dict[str, list[list[int]]]],
+    ) -> None:
+        for ports, local_block_ids, remote_block_ids in zip(
+            remote_handshake_port_list, local_block_ids_list, remote_block_ids_list
+        ):
+            for remote_port in ports:
+                if remote_port not in transfer_mappings:
+                    transfer_mappings[remote_port] = {
+                        "local_block_ids": [[] for _ in range(self.hma_group_size)],
+                        "remote_block_ids": [[] for _ in range(self.hma_group_size)],
+                    }
+                transfer_mappings[remote_port]["local_block_ids"][group_idx].extend(local_block_ids)
+                transfer_mappings[remote_port]["remote_block_ids"][group_idx].extend(remote_block_ids)
+
+    def _get_hybrid_kv_split_metadata(
+        self,
+        req_id: str,
+        meta: ReqMeta,
+    ) -> dict[int, dict[str, list[list[int]]]]:
+        transfer_mappings: dict[int, dict[str, list[list[int]]]] = {}
+        for group_idx in range(self.hma_group_size):
+            if self._is_mamba_group[group_idx]:
+                split_metadata = self._get_mamba_group_kv_split_metadata(meta, group_idx)
+            else:
+                split_metadata = self._get_attn_group_kv_split_metadata(req_id, meta, group_idx)
+            self._merge_group_kv_split_metadata(*split_metadata, group_idx, transfer_mappings)
+        return transfer_mappings
+
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
         for req_id, meta in metadata.requests.items():
@@ -1701,7 +1806,48 @@ class MooncakeConnectorWorker:
             tp_num_need_pulls = self._get_tp_num_need_pulls(prefill_tp_size)
             remote_req_id = meta.remote_request_id
 
-            if self._has_mamba:
+            if self._has_mamba and meta.remote_pcp_size * meta.remote_dcp_size > 1:
+                assert self.kv_recv_thread is not None
+                if not self._is_attn_mamba_hybrid:
+                    raise AssertionError(
+                        "Mooncake connector only supports CP with Mamba in attention+Mamba hybrid models."
+                    )
+                assert prefill_tp_size == self.tp_size, (
+                    "Mooncake connector does not support different TP size with Mamba."
+                )
+                transfer_mappings = self._get_hybrid_kv_split_metadata(req_id, meta)
+                remote_port_send_num: dict[int, RemotePortInfo] = {}
+                for port in range(prefill_tp_size * meta.remote_pcp_size):
+                    remote_host_info = meta.remote_multi_nodes_meta_mapping.get(str(port), None)
+                    remote_host = meta.remote_host if remote_host_info is None else remote_host_info["host"]
+                    remote_port_send_num[meta.remote_port + port] = {"num": 0, "host": remote_host}
+                for remote_port in transfer_mappings:
+                    remote_port_send_num[remote_port]["num"] += 1
+                self.remote_port_send_num[meta.remote_engine_id] = remote_port_send_num
+
+                transfer_items = list(transfer_mappings.items())
+                for task_idx, (remote_port, block_dict) in enumerate(transfer_items):
+                    remote_host, remote_engine_id = self._get_remote_host_info_by_port(
+                        meta.remote_port,
+                        remote_port,
+                        meta.remote_host,
+                        meta.remote_engine_id,
+                        meta.remote_multi_nodes_meta_mapping,
+                    )
+                    self.kv_recv_thread.add_request(
+                        request_id=req_id,
+                        remote_request_id=remote_req_id,
+                        local_block_ids=block_dict["local_block_ids"],
+                        remote_block_ids=block_dict["remote_block_ids"],
+                        remote_engine_id=remote_engine_id,
+                        remote_host=remote_host,
+                        remote_handshake_port=remote_port,
+                        offset=0,
+                        tp_num_need_pulls=1,
+                        remote_port_send_num=remote_port_send_num,
+                        all_task_done=(task_idx == len(transfer_items) - 1),
+                    )
+            elif self._has_mamba:
                 assert self.kv_recv_thread is not None
                 assert meta.remote_pcp_size * meta.remote_dcp_size * self.pcp_size * self.dcp_size == 1, (
                     "Mooncake connector does not support CP with Mamba."
@@ -1803,7 +1949,7 @@ class MooncakeConnectorWorker:
                 self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
 
     def _get_tp_num_need_pulls(self, prefill_tp_size: int) -> int:
-        if self._has_mamba:
+        if self._has_mamba and not self._is_attn_mamba_hybrid:
             assert prefill_tp_size == self.tp_size, "Mooncake connector does not support different TP size with Mamba."
             return prefill_tp_size
         if prefill_tp_size is None:
