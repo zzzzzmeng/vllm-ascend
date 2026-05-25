@@ -1424,12 +1424,13 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         meta.remote_pcp_size = 2
         meta.remote_dcp_size = 2
         meta.remote_port = 30000
+        meta.num_prompt_blocks = 5
         meta.local_block_ids = [[1, 2], [20]]
-        meta.remote_block_ids = [[10, 11], [30, 31, 32, 33, 34]]
+        meta.remote_block_ids = [[10, 11], [30, 31]]
 
         self.assertEqual(
             worker._get_mamba_group_kv_split_metadata(meta, 1),
-            ([[30001]], [[20]], [[34]]),
+            ([[30001]], [[20]], [[31]]),
         )
 
     def test_get_hybrid_kv_split_metadata_merges_attn_and_mamba_groups(self):
@@ -1449,8 +1450,9 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         meta.remote_pcp_size = 2
         meta.remote_dcp_size = 2
         meta.remote_port = 30000
+        meta.num_prompt_blocks = 5
         meta.local_block_ids = [[1, 2], [20]]
-        meta.remote_block_ids = [[10, 11], [30, 31, 32, 33, 34]]
+        meta.remote_block_ids = [[10, 11], [30, 31]]
 
         transfer_mappings = worker._get_hybrid_kv_split_metadata("req0", meta)
 
@@ -1458,7 +1460,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             transfer_mappings[30001],
             {
                 "local_block_ids": [[1], [20]],
-                "remote_block_ids": [[10], [34]],
+                "remote_block_ids": [[10], [31]],
             },
         )
         self.assertEqual(

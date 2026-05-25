@@ -1364,6 +1364,11 @@ class MooncakeConnectorWorker:
         kv_cache_addr_to_idx: dict[int, int] = {}
         ptrs = []
         lengths = []
+
+        def append_group_addr_idx(group_idx: int, addr_idx: int) -> None:
+            if addr_idx not in self.kv_cache_group_addr_indices[group_idx]:
+                self.kv_cache_group_addr_indices[group_idx].append(addr_idx)
+
         if not self._is_hma_required:
             for layer_name, kv_cache_tuple in kv_caches.items():
                 layer_spec = self._layer_specs[layer_name]
@@ -1381,7 +1386,7 @@ class MooncakeConnectorWorker:
                     data_ptr = single_kv_cache.data_ptr()
                     kv_cache_addr_to_idx[data_ptr] = len(kv_caches_base_addr)
                     kv_caches_base_addr.append(data_ptr)
-                    self.kv_cache_group_addr_indices[0].append(kv_cache_addr_to_idx[data_ptr])
+                    append_group_addr_idx(0, kv_cache_addr_to_idx[data_ptr])
                     ptrs.append(data_ptr)
                     lengths.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape))
         elif self._has_mamba:
@@ -1406,7 +1411,7 @@ class MooncakeConnectorWorker:
                             if layer_name in group.layer_names
                         )
                         if data_ptr in kv_cache_addr_to_idx:
-                            self.kv_cache_group_addr_indices[group_idx].append(kv_cache_addr_to_idx[data_ptr])
+                            append_group_addr_idx(group_idx, kv_cache_addr_to_idx[data_ptr])
                             continue
                         tensor_num_blocks = single_kv_cache.shape[0]
                         block_size_scale = tensor_num_blocks // self.num_blocks
@@ -1416,7 +1421,7 @@ class MooncakeConnectorWorker:
                         )
                         kv_cache_addr_to_idx[data_ptr] = len(kv_caches_base_addr)
                         kv_caches_base_addr.append(data_ptr)
-                        self.kv_cache_group_addr_indices[group_idx].append(kv_cache_addr_to_idx[data_ptr])
+                        append_group_addr_idx(group_idx, kv_cache_addr_to_idx[data_ptr])
                         share_tensor_addr.append(data_ptr)
                     if isinstance(layer_spec, MambaSpec) and len(self._mamba_ssm_size) == 2:
                         conv_padding = self.num_blocks * self._mamba_ssm_size[0]
@@ -1753,9 +1758,21 @@ class MooncakeConnectorWorker:
             return [], [], []
 
         remote_cp_size = meta.remote_pcp_size * meta.remote_dcp_size
-        final_remote_block_idx = len(remote_block_ids) - self.num_speculative_tokens - 1
-        final_remote_block_idx = max(final_remote_block_idx, 0)
-        remote_final_cp_rank = final_remote_block_idx % remote_cp_size
+        prompt_blocks = meta.num_prompt_blocks
+        assert prompt_blocks > 0, "Mamba PCP transfer requires positive prompt blocks."
+        remote_block_nums_all = [prompt_blocks // remote_cp_size] * remote_cp_size
+        for cp_rank in range(prompt_blocks % remote_cp_size):
+            remote_block_nums_all[cp_rank] += 1
+        remote_final_cp_rank = (prompt_blocks - 1) % remote_cp_size
+        final_remote_block_idx = remote_block_nums_all[remote_final_cp_rank] - 1
+        assert final_remote_block_idx >= 0, (
+            f"Mamba final block rank({remote_final_cp_rank}) has no prompt block. "
+            f"prompt_blocks={prompt_blocks}, remote_cp_size={remote_cp_size}"
+        )
+        assert final_remote_block_idx < len(remote_block_ids), (
+            f"Mamba final block index({final_remote_block_idx}) is out of "
+            f"remote blocks({len(remote_block_ids)})."
+        )
         remote_pcp_rank = remote_final_cp_rank // meta.remote_dcp_size
         remote_handshake_port = meta.remote_port + remote_pcp_rank * prefill_tp_size + self.tp_rank
 
