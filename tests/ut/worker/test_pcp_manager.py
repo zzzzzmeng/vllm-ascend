@@ -320,6 +320,44 @@ def test_generate_pcp_mtp_input(
                        target_query_start_loc_pcp_full)
 
 
+def test_get_padded_slot_mapping_hybrid_uses_unpadded_tokens():
+    max_num_reqs = 4
+    max_num_tokens = 32
+    vllm_config = MagicMock()
+    vllm_config.model_config.hf_config.model_type = "qwen3_next"
+    vllm_config.speculative_config = None
+    vllm_config.scheduler_config.max_num_seqs = max_num_reqs
+    vllm_config.scheduler_config.max_num_batched_tokens = max_num_tokens
+    pcp_manager = PCPManager(pcp_world_size=2,
+                             pcp_rank=1,
+                             dcp_world_size=1,
+                             dcp_rank=0,
+                             max_buffer_num_tokens=max_num_tokens,
+                             max_num_reqs=max_num_reqs,
+                             device="cpu",
+                             vllm_config=vllm_config,
+                             use_async_scheduling=False,
+                             pin_memory=False)
+
+    pcp_manager.num_scheduled_tokens_padded = np.array([4], dtype=np.int32)
+    pcp_manager.pcp_unpad_mask_cpu_tensor[:8] = torch.tensor(
+        [True, True, True, False, True, False, True, False],
+        dtype=torch.bool)
+    slot_mapping = torch.tensor([10, 11, 12, 13, 14], dtype=torch.int64)
+
+    padded_slot_mapping = pcp_manager.get_padded_slot_mapping(
+        num_tokens=0,
+        num_tokens_padded=0,
+        slot_mapping=slot_mapping,
+    )
+
+    assert torch.equal(
+        padded_slot_mapping,
+        torch.tensor([10, 11, 12, -1, 13, -1, 14, -1],
+                     dtype=torch.int32),
+    )
+
+
 @pytest.mark.parametrize(
     "pcp_world_rank, split_with_q_head_nomask_idx_reqs, split_kv_with_q_tail_nomask_idx_reqs,"
     "head_attn_nomask_seqlens, chunk_seqlens,"
