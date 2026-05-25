@@ -493,26 +493,11 @@ class PCPManager:
         )
         cp_unpad_mask = self.pcp_unpad_mask_cpu_tensor[: num_tokens * self.pcp_world_size]
         pcp_padded_slot_mapping.fill_(-1)
-        if self.pcp_use_hybrid_attn:
-            num_unpadded_tokens = int(cp_unpad_mask.sum().item())
-            assert slot_mapping.numel() >= num_unpadded_tokens, (
-                f"slot_mapping length({slot_mapping.numel()}) is smaller than "
-                f"hybrid PCP unpadded tokens({num_unpadded_tokens})."
-            )
-            padded_slot_mapping_cpu = torch.full(
-                (cp_unpad_mask.numel(),),
-                fill_value=-1,
-                dtype=pcp_padded_slot_mapping.dtype,
-                device="cpu",
-            )
-            padded_slot_mapping_cpu[cp_unpad_mask] = slot_mapping[:num_unpadded_tokens].to(
-                device="cpu",
-                dtype=pcp_padded_slot_mapping.dtype,
-            )
-            pcp_padded_slot_mapping.copy_(padded_slot_mapping_cpu, non_blocking=True)
-            return pcp_padded_slot_mapping.clone()
         pcp_padded_slot_mapping[: num_tokens * self.pcp_world_size][cp_unpad_mask] = slot_mapping
-        return pcp_padded_slot_mapping
+        if self.pcp_use_hybrid_attn:
+            return pcp_padded_slot_mapping.clone()
+        else:
+            return pcp_padded_slot_mapping
 
     def get_restore_hidden_states(
         self,
